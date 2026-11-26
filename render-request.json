@@ -1,0 +1,1 @@
+{"project":"test","audio":"audio/narration_full.wav","output":"TEST","pieces":[{"id":"p01","a":0,"b":3},{"id":"p02","a":3,"b":6}],"sheets":[{"id":"t1","t":1},{"id":"t2","t":4}]}

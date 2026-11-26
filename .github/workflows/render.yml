@@ -1,0 +1,100 @@
+name: render
+on:
+  push:
+    branches: [main]
+    paths: ['render-request.json']
+permissions:
+  contents: write
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      project: ${{ steps.m.outputs.project }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: render-request.json, sparse-checkout-cone-mode: false }
+      - id: m
+        run: |
+          echo "matrix=$(jq -c '{piece: .pieces}' render-request.json)" >> "$GITHUB_OUTPUT"
+          echo "project=$(jq -r '.project' render-request.json)" >> "$GITHUB_OUTPUT"
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: tools and fonts
+        run: |
+          echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true | sudo debconf-set-selections
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-liberation fonts-noto-color-emoji ttf-mscorefonts-installer || sudo apt-get install -y -qq ffmpeg fonts-liberation
+          fc-cache -f
+      - name: render piece
+        working-directory: projects/${{ needs.plan.outputs.project }}
+        run: |
+          npx -y hyperframes@0.9.36 telemetry disable || true
+          npx -y hyperframes@0.9.36 browser ensure
+          nproc; free -m | head -2
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          START=$(date +%s)
+          npx -y hyperframes@0.9.36 render --start ${{ matrix.piece.a }} --end ${{ matrix.piece.b }} -f 30 -w auto --quiet -o "$GITHUB_WORKSPACE/out/${{ matrix.piece.id }}.mp4" .
+          echo "render seconds: $(( $(date +%s) - START ))"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 "$GITHUB_WORKSPACE/out/${{ matrix.piece.id }}.mp4"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: piece-${{ matrix.piece.id }}
+          path: out/*.mp4
+          retention-days: 1
+  publish:
+    needs: [plan, render]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: got, merge-multiple: true }
+      - name: join, add narration, make check sheets
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          P="projects/$(jq -r '.project' render-request.json)"
+          AUDIO=$(jq -r '.audio // empty' render-request.json)
+          NAME=$(jq -r '.output // "final"' render-request.json)
+          mkdir pub
+          ls -l got
+          if [ -n "$AUDIO" ]; then
+            : > list.txt
+            for id in $(jq -r '.pieces[].id' render-request.json); do
+              [ -f "got/$id.mp4" ] || { echo "MISSING PIECE $id" | tee -a pub/MISSING.txt; continue; }
+              ffmpeg -y -loglevel error -i "got/$id.mp4" -an -c:v copy "got/v_$id.mp4"
+              echo "file '$PWD/got/v_$id.mp4'" >> list.txt
+            done
+            ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -c copy body.mp4
+            ffmpeg -y -loglevel error -i body.mp4 -i "$P/$AUDIO" -map 0:v -map 1:a -c:v copy -c:a aac -b:a 192k -movflags +faststart "$NAME.mp4"
+            ffprobe -v error -show_entries format=duration -of csv=p=0 "$NAME.mp4" | tee pub/DURATION.txt
+            ffmpeg -hide_banner -nostats -i "$NAME.mp4" -af ebur128=peak=true -f null - 2>&1 | grep -E "^\s+I:|Peak:" | tail -2 | tee pub/LOUDNESS.txt
+            ffmpeg -hide_banner -nostats -i "$NAME.mp4" -vf "freezedetect=n=0.003:d=3" -an -f null - 2>&1 | grep freeze_ | tee pub/FREEZE.txt || true
+            n=0
+            jq -r '.sheets[]? | "\(.id) \(.t)"' render-request.json | while read id t; do
+              n=$((n+1))
+              ffmpeg -y -loglevel error -ss "$t" -i "$NAME.mp4" -frames:v 1 -vf "scale=640:360,drawtext=text='$id ${t}s':x=8:y=6:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.6" -q:v 3 "$(printf 'f_%03d.jpg' $n)" </dev/null
+            done
+            if ls f_*.jpg >/dev/null 2>&1; then
+              total=$(ls f_*.jpg | wc -l); i=0
+              for s in $(seq 0 12 $((total-1))); do i=$((i+1)); ffmpeg -y -loglevel error -start_number $((s+1)) -i f_%03d.jpg -frames:v 1 -vf "tile=3x4" -q:v 3 "pub/$(printf 'sheet_%02d.jpg' $i)"; done
+            fi
+            sha256sum "$NAME.mp4" > "pub/$NAME.sha256"
+            split -b 90M -d "$NAME.mp4" "pub/$NAME.mp4.part_"
+          else
+            cp got/*.mp4 pub/
+          fi
+          cd pub && ls -l
+          git init -q -b out
+          git config user.name "render-bot"; git config user.email "render-bot@users.noreply.github.com"
+          git add . && git commit -q -m "render run ${{ github.run_number }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" out
